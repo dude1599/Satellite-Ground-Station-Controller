@@ -1,7 +1,7 @@
 # 📡 Satellite Ground Station Controller
 **위성 상태 실시간 모니터링 및 자율 관제(Auto-Commanding) 시스템**
 
-이 프로젝트는 위성(OBC)과 UDP 통신을 통해 실시간으로 텔레메트리(TM)를 수신하고, 위성의 상태에 따라 자동으로 명령(TC)을 송신하는  
+이 프로젝트는 위성(OBC)과 UDP 통신을 통해 실시간으로 텔레메트리(TM)를 수신하고, 위성의 상태에 따라 자동으로 명령(TC)을 송신하는   
 파이썬 기반의 지상국 시뮬레이터입니다.
 
 ## 🚀 Key Features

@@ -21,16 +21,15 @@ def crc16_xmodem(data: bytes):
             crc &= 0xFFFF                   # 16진수에서 계속 연산하기 위해.. 16비트 유지하기 위해..
     return crc
 
-# 🌟 명령 전송을 언제든 호출할 수 있도록 함수로 분리
+# 명령 전송을 언제든 호출할 수 있도록 함수로 분리
 def send_command(sock, p_type):
     global tc_seq
-    
+    # p_type (인자로 받음) : Type: 모드 명령   B : (1 byte)  : 명령어 분류: 패킷이 명령(TC)인지, 상태보고(TM)인지, 응답(ACK/NAK)인지
     # > : Big-Endian
     # H : unsigned short (2 bytes), h : signed short
     # B : unsigned char (1 byte)
     magic = 0xCAFE      # Magic Number      // H : (2 bytes) : 데이터 동기화 및 식별: 수신측에서 "이것이 우리 위성의 패킷인가?"를 가장 먼저 판단.
     ver = 0x01          # Version 1         // B : (1 byte)  : 프로토콜 호환성: 추후 패킷 구조가 변경되었을 때, 구버전과 신버전을 구분하여 처리하기 위함.
-    # p_type (인자로 받음) : Type: 모드 명령   B : (1 byte)  : 명령어 분류: 패킷이 명령(TC)인지, 상태보고(TM)인지, 응답(ACK/NAK)
     seq = tc_seq        # Sequence Number   // H : (2 bytes) : 추적 및 중복 방지: 지상국이 보낸 패킷에 번호를 매겨, 위성이 보낸 답장(ACK)과 짝을 맞춤.
     p_len = 0           # Payload 길이      // H : (2 bytes) : 가변 데이터 길이: 헤더 뒤에 붙는 실제 본문(Payload)의 크기를 알림.
 
@@ -49,11 +48,11 @@ def auto_control_center():
     # socket.AF_INET: IPv4 주소 체계를 사용 / socket.SOCK_DGRAM: UDP(User Datagram Protocol) 방식을 사용
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     
-    # 처음 켤 때 위성을 NOMINAL 모드로 깨움
+    # 처음 켤 때 위성을 NOMINAL 모드로
     print("지상국: 위성 초기화 명령 전송 (NOMINAL 모드)")
     send_command(sock, 0x20) 
     
-    # 텔레메트리는 계속 기다려야 하므로 타임아웃 해제 (무한 대기)
+    # TM은 계속 기다려야 하므로 타임아웃 해제 = 계속 대기
     sock.settimeout(None) 
     
     print("-" * 50)
@@ -79,23 +78,32 @@ def auto_control_center():
                 # 페이로드(5바이트) 파싱: H(배터리 2, 무부호) + h(온도 2, 부호있음) + B(모드 1)
                 battery, temperature, mode_byte = struct.unpack('>HhB', data[8:13])
                 
-                # 모드 바이트를 문자열로 변환
-                mode_str = "SAFE" if mode_byte == 0x10 else "NOMINAL"
+                mode_map = {
+                    0x40: "BOOT",
+                    0x20: "NOMINAL",
+                    0x10: "SAFE",
+                    0x30: "EMERGENCY"
+                }
+                mode_str = mode_map.get(mode_byte, "UNKNOWN")
                 
-                print(f"[TM 수신] Seq: {seq:04d} | 모드: [{mode_str:<7}] | 🔋 배터리: {battery:3d}% | 🌡️ 온도: {temperature:3d}°C")
+                print(f"[TM 수신] Seq: {seq:04d} | 모드: [{mode_str:<9}] | 🔋 배터리: {battery:3d}% | 🌡️ 온도: {temperature:3d}°C")
                 
                 # ==========================================
                 # 지상국 자율 관제 로직
                 # ==========================================
-                # 배터리가 20% 이하로 떨어지면 강제로 SAFE 모드 전환
-                if mode_byte == 0x20 and battery <= 20:
-                    print("\n🚨 [위험] 배터리 고갈 임박! 태양광 충전을 위해 SAFE 모드 전환 명령을 송신합니다!")
-                    send_command(sock, 0x10) # 0x10 = SAFE
+                # 위급 상황(EMERGENCY) 감지 시 긴급표시 로그 출력
+                if mode_byte == 0x30:
+                    print("\n🚨🚨🚨 [비상 사태] 위성 임계 온도 초과! 시스템 보호를 위해 위성이 스스로 셧다운되었습니다! 🚨🚨🚨")
+
+                # 배터리가 20% 이하로 떨어지면 강제로 SAFE 모드 전환 (정상 운용 중일 때만)
+                elif mode_byte == 0x20 and battery <= 20:
+                    print("\n⚠️ [경고] 배터리 고갈 임박! 태양광 충전을 위해 SAFE 모드 전환 명령을 송신합니다!")
+                    send_command(sock, 0x10) 
                 
-                # 배터리가 95% 이상 충전되면 다시 임무 수행(NOMINAL) 지시
+                # 배터리가 95% 이상 충전되면 다시 임무 수행(NOMINAL) 지시 (충전 중일 때만)
                 elif mode_byte == 0x10 and battery >= 95:
                     print("\n✅ [안정] 배터리 충전 완료. 임무 재개를 위해 NOMINAL 모드 전환 명령을 송신합니다!")
-                    send_command(sock, 0x20) # 0x20 = NOMINAL
+                    send_command(sock, 0x20)
                 
     except KeyboardInterrupt:
         print("\n🛑 모니터링을 종료합니다. (Ctrl+C)")

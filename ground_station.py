@@ -52,64 +52,80 @@ def auto_control_center():
     print("지상국: 위성 초기화 명령 전송 (NOMINAL 모드)")
     send_command(sock, 0x20) 
     
-    # TM은 계속 기다려야 하므로 타임아웃 해제 = 계속 대기
+    # 위성(OBC)측에서 LOS(통신두절)될 경우 TM을 못받는 상황을 알기 위해 3초 타임아웃 설정
     sock.settimeout(None) 
     
     print("-" * 50)
     print("📡 위성 자동 관제(Auto-Commanding) 시스템 가동 중...")
     print("-" * 50)
+
+    # 통신 단절(LOS) 상태를 추적하는 플래그 변수
+    is_los = False
     
     try:
         while True:
-            # 위성에서 응답(또는 TM) 올때까지 대기 상태 들어갔다가 응답 올시 변수에 저장
-            data, addr = sock.recvfrom(1024) 
-            
-            # 헤더(8바이트) 먼저 파싱
-            magic, ver, p_type, seq, p_len = struct.unpack('>HBBHH', data[:8])
-            
-            # 1. ACK 패킷이 도착한 경우 (지상국 명령을 위성이 잘 받았다는 뜻)
-            if p_type == 0x00:
-                print(f"  └─ ✅ [ACK 수신] 위성이 지상국 명령(Seq:{seq})을 정상적으로 수행했습니다.")
-            elif p_type == 0xFF:
-                print(f"  └─ ❌ [NAK 수신] 위성 명령 수신 실패 (CRC 에러 등, Seq:{seq})")
-            
-            # 2. TM 패킷이 도착한 경우
-            elif p_type == 0x05:
-                # 페이로드(5바이트) 파싱: H(배터리 2, 무부호) + h(온도 2, 부호있음) + B(모드 1)
-                battery, temperature, mode_byte = struct.unpack('>HhB', data[8:13])
-                
-                mode_map = {
-                    0x40: "BOOT",
-                    0x20: "NOMINAL",
-                    0x10: "SAFE",
-                    0x30: "EMERGENCY"
-                }
-                mode_str = mode_map.get(mode_byte, "UNKNOWN")
-                
-                print(f"[TM 수신] Seq: {seq:04d} | 모드: [{mode_str:<9}] | 🔋 배터리: {battery:3d}% | 🌡️ 온도: {temperature:3d}°C")
-                
-                # ==========================================
-                # 지상국 자율 관제 로직
-                # ==========================================
-                # 위급 상황(EMERGENCY) 감지 시 긴급표시 로그 출력
-                if mode_byte == 0x30:
-                    # 온도가 0도 이하로 충분히 식었다면 지상국이 SAFE 모드 전환 전송
-                    if temperature <= 0:
-                        print("\n🛠️ [복구] 위성 온도가 안정권(0°C 이하)으로 식었습니다. SAFE 모드로 시스템을 재부팅합니다!")
-                        send_command(sock, 0x10) # 0x10 = SAFE
-                    else:
-                        # 아직 안 식었으면 사이렌 계속 울림
-                        print("🚨🚨🚨 [비상 사태] 위성 셧다운 상태 유지 중... 온도 냉각 대기 🚨🚨🚨")
+            try:
+                # 위성에서 응답(또는 TM) 올때까지 대기 상태 들어갔다가 응답 올시 변수에 저장
+                data, addr = sock.recvfrom(1024) 
 
-                # 배터리가 20% 이하로 떨어지면 강제로 SAFE 모드 전환 (정상 운용 중일 때만)
-                elif mode_byte == 0x20 and battery <= 20:
-                    print("\n⚠️ [경고] 배터리 고갈 임박! 태양광 충전을 위해 SAFE 모드 전환 명령을 송신합니다!")
-                    send_command(sock, 0x10) 
+                # 통신이 끊겼다가 다시 데이터가 들어오면 AOS(통신 복구) 선언
+                if is_los:
+                    print("\n📡 [AOS] 위성 통신 복구! 과거 데이터 덤프(Dump) 및 수신 재개...")
+                    is_los = False # 다시 정상 상태로 변경
+
+                # 헤더(8바이트) 먼저 파싱
+                magic, ver, p_type, seq, p_len = struct.unpack('>HBBHH', data[:8])
                 
-                # 배터리가 95% 이상 충전되면 다시 임무 수행(NOMINAL) 지시 (충전 중일 때만)
-                elif mode_byte == 0x10 and battery >= 95:
-                    print("\n✅ [안정] 배터리 충전 완료. 임무 재개를 위해 NOMINAL 모드 전환 명령을 송신합니다!")
-                    send_command(sock, 0x20)
+                # 1. ACK 패킷이 도착한 경우 (지상국 명령을 위성이 잘 받았다는 뜻)
+                if p_type == 0x00:
+                    print(f"  └─ ✅ [ACK 수신] 위성이 지상국 명령(Seq:{seq})을 정상적으로 수행했습니다.")
+                elif p_type == 0xFF:
+                    print(f"  └─ ❌ [NAK 수신] 위성 명령 수신 실패 (CRC 에러 등, Seq:{seq})")
+                
+                # 2. TM 패킷이 도착한 경우
+                elif p_type == 0x05:
+                    # 페이로드(5바이트) 파싱: H(배터리 2, 무부호) + h(온도 2, 부호있음) + B(모드 1)
+                    battery, temperature, mode_byte = struct.unpack('>HhB', data[8:13])
+                    
+                    mode_map = {
+                        0x40: "BOOT",
+                        0x20: "NOMINAL",
+                        0x10: "SAFE",
+                        0x30: "EMERGENCY"
+                    }
+                    mode_str = mode_map.get(mode_byte, "UNKNOWN")
+                    
+                    print(f"[TM 수신] Seq: {seq:04d} | 모드: [{mode_str:<9}] | 🔋 배터리: {battery:3d}% | 🌡️ 온도: {temperature:3d}°C")
+                    
+                    # ==========================================
+                    # 지상국 자율 관제 로직
+                    # ==========================================
+                    # 위급 상황(EMERGENCY) 감지 시 긴급표시 로그 출력
+                    if mode_byte == 0x30:
+                        # 온도가 0도 이하로 충분히 식었다면 지상국이 SAFE 모드 전환 전송
+                        if temperature <= 0:
+                            print("\n🛠️ [복구] 위성 온도가 안정권(0°C 이하)으로 식었습니다. SAFE 모드로 시스템을 재부팅합니다!")
+                            send_command(sock, 0x10) # 0x10 = SAFE
+                        else:
+                            # 아직 안 식었으면 사이렌 계속 울림
+                            print("🚨🚨🚨 [비상 사태] 위성 셧다운 상태 유지 중... 온도 냉각 대기 🚨🚨🚨")
+
+                    # 배터리가 20% 이하로 떨어지면 강제로 SAFE 모드 전환 (정상 운용 중일 때만)
+                    elif mode_byte == 0x20 and battery <= 20:
+                        print("\n⚠️ [경고] 배터리 고갈 임박! 태양광 충전을 위해 SAFE 모드 전환 명령을 송신합니다!")
+                        send_command(sock, 0x10) 
+                    
+                    # 배터리가 95% 이상 충전되면 다시 임무 수행(NOMINAL) 지시 (충전 중일 때만)
+                    elif mode_byte == 0x10 and battery >= 95:
+                        print("\n✅ [안정] 배터리 충전 완료. 임무 재개를 위해 NOMINAL 모드 전환 명령을 송신합니다!")
+                        send_command(sock, 0x20)
+
+            # 3초간 데이터가 안 와서 타임아웃 발생 시
+            except socket.timeout:
+                if not is_los: # 처음 끊겼을 때만 메시지 1번 출력
+                    print("\n⚠️ [LOS] 위성과 통신이 끊겼습니다! (Telemetry 수신 대기 중...)")
+                    is_los = True
+                continue # 다시 while 문 처음으로 돌아가서 계속 대기
                 
     except KeyboardInterrupt:
         print("\n🛑 모니터링을 종료합니다. (Ctrl+C)")

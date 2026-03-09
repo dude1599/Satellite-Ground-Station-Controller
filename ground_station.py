@@ -52,8 +52,8 @@ def auto_control_center():
     print("지상국: 위성 초기화 명령 전송 (NOMINAL 모드)")
     send_command(sock, 0x20) 
     
-    # 위성(OBC)측에서 LOS(통신두절)될 경우 TM을 못받는 상황을 알기 위해 3초 타임아웃 설정
-    sock.settimeout(None) 
+    # 위성(OBC)측에서 LOS(통신두절)될 경우 TM을 못받는 상황을 알기 위해 2초 타임아웃 설정
+    sock.settimeout(2.0) 
     
     print("-" * 50)
     print("📡 위성 자동 관제(Auto-Commanding) 시스템 가동 중...")

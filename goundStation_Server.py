@@ -1,15 +1,16 @@
 import socket
 import struct
+import threading
 import time
 
-# ========================================================
-# 03.10일 이후로, groundStation.py와 operator.py로 분리.
-# ========================================================
+# === 지상국 : Client (수신 및 중계 서버) ===
+# TC : 0x10=SAFE, 0x20=NOMINAL / TM : 0x05 / 응답 : 0x00=ACK, 0xFF=NAK
 
-# === 지상국 : Client ===   : TC : 0x10 = 0x10=SAFE, 0x20=NOMINAL / TM : 0x05 / 응답 : 0x00=ACK, 0xFF=NAK
-# 1. 위성 주소 설정
+# 위성 주소 설정
 SAT_IP = "127.0.0.1"
 SAT_PORT = 9000
+LOCAL_CMD_PORT = 8000 # 운영자 터미널과 연결할 내부 포트
+
 tc_seq = 1  # 지상국이 보내는 명령의 시퀀스 번호
 
 def crc16_xmodem(data: bytes):
@@ -44,33 +45,57 @@ def send_command(sock, p_type):
     packet = header + struct.pack('>H', crc_val)
 
     sock.sendto(packet, (SAT_IP, SAT_PORT))
-    print(f"지상국: 위성으로 명령 전송 완료 (Type: 0x{p_type:02X}, Seq: {seq})")
+    print(f"\n[송신] 위성으로 명령 전송 완료 (Type: 0x{p_type:02X}, Seq: {seq})")
     
     tc_seq += 1 # 보낼 때마다 지상국 시퀀스 번호 1씩 증가
 
+# 운영자 터미널(operator.py)에서 오는 문자열 명령을 받아 위성으로 중계하는 스레드
+def listen_for_operator_commands(sat_sock):
+    cmd_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    cmd_sock.bind(("127.0.0.1", LOCAL_CMD_PORT))
+    
+    while True:
+        data, _ = cmd_sock.recvfrom(1024)
+        cmd_str = data.decode('utf-8').strip().upper()
+        
+        if cmd_str == "SAFE":
+            print("\n👨‍🚀 [운영자 수동 개입] SAFE 모드 전환 명령 수신!")
+            send_command(sat_sock, 0x10)
+        elif cmd_str == "NOMINAL":
+            print("\n👨‍🚀 [운영자 수동 개입] NOMINAL 모드 전환 명령 수신!")
+            send_command(sat_sock, 0x20)
+
 def auto_control_center():
     # socket.AF_INET: IPv4 주소 체계를 사용 / socket.SOCK_DGRAM: UDP(User Datagram Protocol) 방식을 사용
-    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sat_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     
     # 처음 켤 때 위성을 NOMINAL 모드로
-    print("지상국: 위성 초기화 명령 전송 (NOMINAL 모드)")
-    send_command(sock, 0x20) 
+    print("지상국 서버 시작: 위성 초기화 명령 전송 (NOMINAL 모드)")
+    send_command(sat_sock, 0x20) 
     
-    # 위성(OBC)측에서 LOS(통신두절)될 경우 TM을 못받는 상황을 알기 위해 2초 타임아웃 설정
-    sock.settimeout(2.0) 
+    # 위성(OBC)측에서 LOS(통신두절)될 경우 TM을 못받는 상황을 알기 위해 2.0초 타임아웃 설정
+    sat_sock.settimeout(2.0) 
+
+    # 운영자 명령 수신 스레드 가동
+    cmd_thread = threading.Thread(target=listen_for_operator_commands, args=(sat_sock,), daemon=True)
+    cmd_thread.start()
     
-    print("-" * 50)
-    print("📡 위성 자동 관제(Auto-Commanding) 시스템 가동 중...")
-    print("-" * 50)
+    print("=" * 60)
+    print("📡 위성 자동 관제(Auto-Commanding) 서버 가동 중... (모니터링 화면)")
+    print("   수동 제어는 'operator.py' 터미널 창을 이용하세요.")
+    print("=" * 60)
 
     # 통신 단절(LOS) 상태를 추적하는 플래그 변수
     is_los = False
+    
+    # 명령 폭주 방지를 위한 쿨타임 변수
+    last_auto_cmd_time = 0.0
     
     try:
         while True:
             try:
                 # 위성에서 응답(또는 TM) 올때까지 대기 상태 들어갔다가 응답 올시 변수에 저장
-                data, addr = sock.recvfrom(1024) 
+                data, addr = sat_sock.recvfrom(1024) 
 
                 # 통신이 끊겼다가 다시 데이터가 들어오면 AOS(통신 복구) 선언
                 if is_los:
@@ -102,29 +127,38 @@ def auto_control_center():
                     print(f"[TM 수신] Seq: {seq:04d} | 모드: [{mode_str:<9}] | 🔋 배터리: {battery:3d}% | 🌡️ 온도: {temperature:3d}°C")
                     
                     # ==========================================
-                    # 지상국 자율 관제 로직
+                    # 지상국 자율 관제 로직 (쿨타임 3초 적용)
                     # ==========================================
-                    # 위급 상황(EMERGENCY) 감지 시 긴급표시 로그 출력
-                    if mode_byte == 0x30:
-                        # 온도가 0도 이하로 충분히 식었다면 지상국이 SAFE 모드 전환 전송
-                        if temperature <= 0:
-                            print("\n🛠️ [복구] 위성 온도가 안정권(0°C 이하)으로 식었습니다. SAFE 모드로 시스템을 재부팅합니다!")
-                            send_command(sock, 0x10) # 0x10 = SAFE
-                        else:
-                            # 아직 안 식었으면 사이렌 계속 울림
-                            print("🚨🚨🚨 [비상 사태] 위성 셧다운 상태 유지 중... 온도 냉각 대기 🚨🚨🚨")
-
-                    # 배터리가 20% 이하로 떨어지면 강제로 SAFE 모드 전환 (정상 운용 중일 때만)
-                    elif mode_byte == 0x20 and battery <= 20:
-                        print("\n⚠️ [경고] 배터리 고갈 임박! 태양광 충전을 위해 SAFE 모드 전환 명령을 송신합니다!")
-                        send_command(sock, 0x10) 
+                    current_time = time.time()
                     
-                    # 배터리가 95% 이상 충전되면 다시 임무 수행(NOMINAL) 지시 (충전 중일 때만)
-                    elif mode_byte == 0x10 and battery >= 95:
-                        print("\n✅ [안정] 배터리 충전 완료. 임무 재개를 위해 NOMINAL 모드 전환 명령을 송신합니다!")
-                        send_command(sock, 0x20)
+                    # 마지막 자동 명령 발송 후 3초가 지났을 때만 개입 (덤프 시 명령 폭주 방지)
+                    if current_time - last_auto_cmd_time > 3.0:
+                        
+                        # 위급 상황(EMERGENCY) 감지 시 긴급표시 로그 출력
+                        if mode_byte == 0x30:
+                            # 온도가 0도 이하로 충분히 식었다면 지상국이 SAFE 모드 전환 전송
+                            if temperature <= 0:
+                                print("\n🛠️ [자동 복구] 위성 온도가 안정권(0°C 이하)으로 식었습니다. SAFE 모드로 시스템을 재부팅합니다!")
+                                send_command(sat_sock, 0x10) # 0x10 = SAFE
+                                last_auto_cmd_time = current_time # 시간 갱신
+                            else:
+                                # 아직 안 식었으면 사이렌 계속 울림
+                                print("🚨🚨🚨 [비상 사태] 위성 셧다운 상태 유지 중... 온도 냉각 대기 🚨🚨🚨")
+                                last_auto_cmd_time = current_time # 사이렌 폭주 방지를 위해 시간 갱신
 
-            # 3초간 데이터가 안 와서 타임아웃 발생 시
+                        # 배터리가 20% 이하로 떨어지면 강제로 SAFE 모드 전환 (정상 운용 중일 때만)
+                        elif mode_byte == 0x20 and battery <= 20:
+                            print("\n⚠️ [경고] 배터리 고갈 임박! 태양광 충전을 위해 SAFE 모드 전환 명령을 송신합니다!")
+                            send_command(sat_sock, 0x10) 
+                            last_auto_cmd_time = current_time # 시간 갱신
+                        
+                        # 배터리가 95% 이상 충전되면 다시 임무 수행(NOMINAL) 지시 (충전 중일 때만)
+                        elif mode_byte == 0x10 and battery >= 95:
+                            print("\n✅ [안정] 배터리 충전 완료. 임무 재개를 위해 NOMINAL 모드 전환 명령을 송신합니다!")
+                            send_command(sat_sock, 0x20)
+                            last_auto_cmd_time = current_time # 시간 갱신
+
+            # 2초간 데이터가 안 와서 타임아웃 발생 시
             except socket.timeout:
                 if not is_los: # 처음 끊겼을 때만 메시지 1번 출력
                     print("\n⚠️ [LOS] 위성과 통신이 끊겼습니다! (Telemetry 수신 대기 중...)")
@@ -132,9 +166,9 @@ def auto_control_center():
                 continue # 다시 while 문 처음으로 돌아가서 계속 대기
                 
     except KeyboardInterrupt:
-        print("\n🛑 모니터링을 종료합니다. (Ctrl+C)")
+        print("\n🛑 서버를 종료합니다. (Ctrl+C)")
     finally:
-        sock.close()
+        sat_sock.close()
 
 if __name__ == "__main__":
     auto_control_center()

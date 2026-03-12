@@ -105,6 +105,26 @@ def auto_control_center():
                 # 헤더(8바이트) 먼저 파싱
                 magic, ver, p_type, seq, p_len = struct.unpack('>HBBHH', data[:8])
                 
+                # ==========================================
+                # [추가됨] 수신 패킷 무결성(CRC) 검증 로직
+                # ==========================================
+                # Payload Length(p_len)를 기반으로 CRC 위치를 역산 (유연한 패킷 처리)
+                crc_start_idx = 8 + p_len 
+                
+                if len(data) >= crc_start_idx + 2:
+                    # 패킷 맨 끝 2바이트에서 수신된 CRC 추출
+                    received_crc = struct.unpack('>H', data[crc_start_idx:crc_start_idx+2])[0]
+                    # 헤더부터 Payload 끝까지의 데이터로 지상국 측 CRC 직접 계산
+                    calculated_crc = crc16_xmodem(data[:crc_start_idx])
+                    
+                    if received_crc != calculated_crc:
+                        print(f"  └─ ❌ [CRC 에러] 손상된 패킷 무시 (Seq:{seq}, 수신:0x{received_crc:04X}, 계산:0x{calculated_crc:04X})")
+                        continue # 손상된 패킷이므로 아래 로직(TM, ACK 처리)을 타지 않고 바로 다음 패킷 대기
+                else:
+                    print(f"  └─ ❌ [패킷 길이 에러] 비정상적인 패킷 무시 (Seq:{seq})")
+                    continue
+                # ==========================================
+
                 # 1. ACK 패킷이 도착한 경우 (지상국 명령을 위성이 잘 받았다는 뜻)
                 if p_type == 0x00:
                     print(f"  └─ ✅ [ACK 수신] 위성이 지상국 명령(Seq:{seq})을 정상적으로 수행했습니다.")
@@ -113,8 +133,13 @@ def auto_control_center():
                 
                 # 2. TM 패킷이 도착한 경우
                 elif p_type == 0x05:
-                    # 페이로드(5바이트) 파싱: H(배터리 2, 무부호) + h(온도 2, 부호있음) + B(모드 1)
-                    battery, temperature, mode_byte = struct.unpack('>HhB', data[8:13])
+                    # 페이로드(7바이트) 파싱: H(배터리 2, 무부호) + h(온도 2, 부호있음) + B(모드 1) + h(궤도각도 2, 부호있음)
+                    # data[8:15] 로 파싱 범위 15로 유지
+                    battery, temperature, mode_byte, raw_orbit_angle = struct.unpack('>HhBh', data[8:15])
+                    
+                    # [추가됨] 궤도 각도 복원 (Scaling Reversal)
+                    # 자바 위성에서 short에 담기 위해 곱했던 10.0을 다시 나누어 소수점 단위로 복구합니다.
+                    orbit_angle = raw_orbit_angle / 10.0
                     
                     mode_map = {
                         0x40: "BOOT",
@@ -124,7 +149,8 @@ def auto_control_center():
                     }
                     mode_str = mode_map.get(mode_byte, "UNKNOWN")
                     
-                    print(f"[TM 수신] Seq: {seq:04d} | 모드: [{mode_str:<9}] | 🔋 배터리: {battery:3d}% | 🌡️ 온도: {temperature:3d}°C")
+                    # 출력문에 복원된 궤도 각도(orbit_angle)를 소수점 첫째 자리까지 표시
+                    print(f"[TM 수신] Seq: {seq:04d} | 모드: [{mode_str:<9}] | 🔋 배터리: {battery:3d}% | 🌡️ 온도: {temperature:3d}°C | 🛰️ 궤도: {orbit_angle:.1f}°")
                     
                     # ==========================================
                     # 지상국 자율 관제 로직 (쿨타임 3초 적용)
@@ -161,7 +187,7 @@ def auto_control_center():
             # 2초간 데이터가 안 와서 타임아웃 발생 시
             except socket.timeout:
                 if not is_los: # 처음 끊겼을 때만 메시지 1번 출력
-                    print("\n⚠️ [LOS] 위성과 통신이 끊겼습니다! (Telemetry 수신 대기 중...)")
+                    print("\n⚠️ [LOS] 위성이 가시권을 벗어났거나 통신이 끊겼습니다! (Telemetry 수신 대기 중...)")
                     is_los = True
                 continue # 다시 while 문 처음으로 돌아가서 계속 대기
                 

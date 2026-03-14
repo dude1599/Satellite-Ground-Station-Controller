@@ -4,7 +4,8 @@ import threading
 import time
 
 # === 지상국 : Client (수신 및 중계 서버) ===
-# TC : 0x10=SAFE, 0x20=NOMINAL / TM : 0x05 / 응답 : 0x00=ACK, 0xFF=NAK
+# TM 패킷을 실시간(RT: 0x05)과 과거덤프(PB: 0x06)로 분리
+# TC : 0x10=SAFE, 0x20=NOMINAL / TM(RT) : 0x05 / TM(PB) : 0x06 / 응답 : 0x00=ACK, 0xFF=NAK
 
 # 위성 주소 설정
 SAT_IP = "127.0.0.1"
@@ -17,7 +18,7 @@ def crc16_xmodem(data: bytes):
     crc = 0
     for byte in data:                       # data에서 1bytes(8bit : "0xCA", "0xFE")씩 꺼낸다.
         crc ^= (byte << 8)                  # ^은 XOR연산으로, 같으면 0, 다르면 1 ->"배타적" :  순수하게 하나만 참(1)인 상태만 인정. 
-        # crc 변수에는 xor로 인해 byte가 왼쪽으로 8비트(1byte) 이동한 것과 같은 값이 담긴다. ex) crc = 0xCA00
+                                            # crc 변수에는 xor로 인해 byte가 왼쪽으로 8비트(1byte) 이동한 것과 같은 값이 담긴다. ex) crc = 0xCA00
         for _ in range(8):                  # 1byte = 8bit이므로 한 비트씩 나눗셈을 수행, <<8 로 앞에 8비트만 유효하므로 8번 실행.
             if crc & 0x8000:                # CRC의 첫 비트(MSB)가 1이면 나눗셈(XOR)이 가능하므로. 1021 = 0001 0000 0010 0001로 CRC에서 쓰는 생성다항식
                 crc = (crc << 1) ^ 0x1021   # 16진수는 15차항까지만 가능하고, 1021은 실제로 16차항이 1로 생략.. 이를 맞추기 위해 crc를 왼쪽 1 shift한다.
@@ -26,7 +27,7 @@ def crc16_xmodem(data: bytes):
             crc &= 0xFFFF                   # 16진수에서 계속 연산하기 위해.. 16비트 유지하기 위해..
     return crc
 
-# 명령 전송을 언제든 호출할 수 있도록 함수로 분리
+# TC 명령 전송 함수
 def send_command(sock, p_type):
     global tc_seq
     # p_type (인자로 받음) : Type: 모드 명령   B : (1 byte)  : 명령어 분류: 패킷이 명령(TC)인지, 상태보고(TM)인지, 응답(ACK/NAK)인지
@@ -39,7 +40,7 @@ def send_command(sock, p_type):
     p_len = 0           # Payload 길이      // H : (2 bytes) : 가변 데이터 길이: 헤더 뒤에 붙는 실제 본문(Payload)의 크기를 알림.
 
     # 포맷: >(빅엔디안) H(Magic) B(Ver) B(Type) H(Seq) H(Len) = 총 8바이트
-    header = struct.pack('>HBBHH', magic, ver, p_type, seq, p_len)  # struct.pack은 자료형을 C 구조체 포맷에 맞춰 바이너리 bytes로 변환해준다.
+    header = struct.pack('>HBBHH', magic, ver, p_type, seq, p_len)  # struct.pack은 자료형을 C 구조체 포맷에 맞춰 바이너리 bytes로 변환.
 
     crc_val = crc16_xmodem(header)
     packet = header + struct.pack('>H', crc_val)
@@ -69,8 +70,8 @@ def auto_control_center():
     # socket.AF_INET: IPv4 주소 체계를 사용 / socket.SOCK_DGRAM: UDP(User Datagram Protocol) 방식을 사용
     sat_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     
-    # 처음 켤 때 위성을 NOMINAL 모드로
-    print("지상국 서버 시작: 위성 초기화 명령 전송 (NOMINAL 모드)")
+    # === TC 패킷 전송 : 처음 켤 때 위성을 NOMINAL 모드로 9000포트로 전송===
+    print("지상국 서버 시작: [TC] 위성 초기화 명령 전송 (NOMINAL 모드)")
     send_command(sat_sock, 0x20) 
     
     # 위성(OBC)측에서 LOS(통신두절)될 경우 TM을 못받는 상황을 알기 위해 2.0초 타임아웃 설정
@@ -94,7 +95,7 @@ def auto_control_center():
     try:
         while True:
             try:
-                # 위성에서 응답(또는 TM) 올때까지 대기 상태 들어갔다가 응답 올시 변수에 저장
+                # 위성에서 응답이 올때까지 대기 상태 들어갔다가 응답 올시 변수에 저장
                 data, addr = sat_sock.recvfrom(1024) 
 
                 # 통신이 끊겼다가 다시 데이터가 들어오면 AOS(통신 복구) 선언
@@ -106,14 +107,13 @@ def auto_control_center():
                 magic, ver, p_type, seq, p_len = struct.unpack('>HBBHH', data[:8])
                 
                 # ==========================================
-                # [추가됨] 수신 패킷 무결성(CRC) 검증 로직
-                # ==========================================
-                # Payload Length(p_len)를 기반으로 CRC 위치를 역산 (유연한 패킷 처리)
+                # 수신 패킷 무결성(CRC) 검증 로직
+                # Payload Length(p_len)를 기반으로 CRC 위치를 역산
                 crc_start_idx = 8 + p_len 
                 
                 if len(data) >= crc_start_idx + 2:
                     # 패킷 맨 끝 2바이트에서 수신된 CRC 추출
-                    received_crc = struct.unpack('>H', data[crc_start_idx:crc_start_idx+2])[0]
+                    received_crc = struct.unpack('>H', data[crc_start_idx:crc_start_idx+2])[0]  # unpack함수는 튜플로 return
                     # 헤더부터 Payload 끝까지의 데이터로 지상국 측 CRC 직접 계산
                     calculated_crc = crc16_xmodem(data[:crc_start_idx])
                     
@@ -123,22 +123,23 @@ def auto_control_center():
                 else:
                     print(f"  └─ ❌ [패킷 길이 에러] 비정상적인 패킷 무시 (Seq:{seq})")
                     continue
-                # ==========================================
+                # ==============================================================================
 
-                # 1. ACK 패킷이 도착한 경우 (지상국 명령을 위성이 잘 받았다는 뜻)
+                # 1. ACK 패킷이 도착한 경우
                 if p_type == 0x00:
                     print(f"  └─ ✅ [ACK 수신] 위성이 지상국 명령(Seq:{seq})을 정상적으로 수행했습니다.")
                 elif p_type == 0xFF:
                     print(f"  └─ ❌ [NAK 수신] 위성 명령 수신 실패 (CRC 에러 등, Seq:{seq})")
                 
                 # 2. TM 패킷이 도착한 경우
-                elif p_type == 0x05:
+                # 0x05(RealTime)와 0x06(PlayBack) 모두 수용하여 파싱
+                elif p_type == 0x05 or p_type == 0x06:
                     # 페이로드(7바이트) 파싱: H(배터리 2, 무부호) + h(온도 2, 부호있음) + B(모드 1) + h(궤도각도 2, 부호있음)
-                    # data[8:15] 로 파싱 범위 15로 유지
+                    # data[8:15] 로 payload 길이인 7 bytes만큼 잘라서 Payload에 들어있는 정보를 아래 변수에 할당
                     battery, temperature, mode_byte, raw_orbit_angle = struct.unpack('>HhBh', data[8:15])
                     
-                    # [추가됨] 궤도 각도 복원 (Scaling Reversal)
-                    # 자바 위성에서 short에 담기 위해 곱했던 10.0을 다시 나누어 소수점 단위로 복구합니다.
+                    # 위성측에서 스케일링(x10)해서 넘긴 궤도 각도 복원
+                    # 자바 위성에서 short에 담기 위해 곱했던 10.0을 다시 나누어 소수점 단위로 복구
                     orbit_angle = raw_orbit_angle / 10.0
                     
                     mode_map = {
@@ -149,40 +150,49 @@ def auto_control_center():
                     }
                     mode_str = mode_map.get(mode_byte, "UNKNOWN")
                     
-                    # 출력문에 복원된 궤도 각도(orbit_angle)를 소수점 첫째 자리까지 표시
-                    print(f"[TM 수신] Seq: {seq:04d} | 모드: [{mode_str:<9}] | 🔋 배터리: {battery:3d}% | 🌡️ 온도: {temperature:3d}°C | 🛰️ 궤도: {orbit_angle:.1f}°")
+                    # -----------------------------------------------------------------
+                    # 0x06 (PB: 과거 덤프 데이터) 처리 로직
+                    # 과거 데이터는 화면에 로깅만 출력
+                    if p_type == 0x06:
+                        print(f" 💾 [PB 수신] (과거 덤프) Seq: {seq:04d} | 모드: [{mode_str:<9}] | 🔋 배터리: {battery:3d}% | 🌡️ 온도: {temperature:3d}°C | 🛰️ 궤도: {orbit_angle:.1f}°")
+                        pass # 아무런 관제 개입 없이 바로 루프 끝으로 감 (다음 패킷 대기)
                     
-                    # ==========================================
-                    # 지상국 자율 관제 로직 (쿨타임 3초 적용)
-                    # ==========================================
-                    current_time = time.time()
-                    
-                    # 마지막 자동 명령 발송 후 3초가 지났을 때만 개입 (덤프 시 명령 폭주 방지)
-                    if current_time - last_auto_cmd_time > 3.0:
+                    # -----------------------------------------------------------------
+                    #  0x05 (RT: 실시간 데이터) 처리 로직
+                    elif p_type == 0x05:
+                        # 출력문에 복원된 궤도 각도(orbit_angle)를 소수점 첫째 자리까지 표시
+                        print(f"[RT 수신] Seq: {seq:04d} | 모드: [{mode_str:<9}] | 🔋 배터리: {battery:3d}% | 🌡️ 온도: {temperature:3d}°C | 🛰️ 궤도: {orbit_angle:.1f}°")
                         
-                        # 위급 상황(EMERGENCY) 감지 시 긴급표시 로그 출력
-                        if mode_byte == 0x30:
-                            # 온도가 0도 이하로 충분히 식었다면 지상국이 SAFE 모드 전환 전송
-                            if temperature <= 0:
-                                print("\n🛠️ [자동 복구] 위성 온도가 안정권(0°C 이하)으로 식었습니다. SAFE 모드로 시스템을 재부팅합니다!")
-                                send_command(sat_sock, 0x10) # 0x10 = SAFE
-                                last_auto_cmd_time = current_time # 시간 갱신
-                            else:
-                                # 아직 안 식었으면 사이렌 계속 울림
-                                print("🚨🚨🚨 [비상 사태] 위성 셧다운 상태 유지 중... 온도 냉각 대기 🚨🚨🚨")
-                                last_auto_cmd_time = current_time # 사이렌 폭주 방지를 위해 시간 갱신
+                        # ==========================================
+                        # 지상국 자율 관제 로직
+                        current_time = time.time()
+                        
+                        # 마지막 자동 명령 발송 후 3초가 지났을 때만 개입 (Los -> AOS로 바뀔 시 Dump되기에, 아래 명령을 보내고 3초 뒤에 아래를 재실행)
+                        if current_time - last_auto_cmd_time > 3.0:
+                            
+                            # 위급 상황(EMERGENCY) 감지 시 긴급표시 로그 출력
+                            if mode_byte == 0x30:
+                                # 온도가 0도 이하로 충분히 식었다면 지상국이 SAFE 모드 전환 전송
+                                if temperature <= 0:
+                                    print("\n🛠️ [자동 복구] 위성 온도가 안정권(0°C 이하)으로 식었습니다. SAFE 모드로 시스템을 재부팅합니다!")
+                                    send_command(sat_sock, 0x10) # 0x10 = SAFE
+                                    last_auto_cmd_time = current_time # 시간 갱신
+                                else:
+                                    # 아직 안 식었으면 사이렌 계속 울림
+                                    print("🚨🚨🚨 [비상 사태] 위성 셧다운 상태 유지 중... 온도 냉각 대기 🚨🚨🚨")
+                                    last_auto_cmd_time = current_time # 사이렌 폭주 방지를 위해 시간 갱신
 
-                        # 배터리가 20% 이하로 떨어지면 강제로 SAFE 모드 전환 (정상 운용 중일 때만)
-                        elif mode_byte == 0x20 and battery <= 20:
-                            print("\n⚠️ [경고] 배터리 고갈 임박! 태양광 충전을 위해 SAFE 모드 전환 명령을 송신합니다!")
-                            send_command(sat_sock, 0x10) 
-                            last_auto_cmd_time = current_time # 시간 갱신
-                        
-                        # 배터리가 95% 이상 충전되면 다시 임무 수행(NOMINAL) 지시 (충전 중일 때만)
-                        elif mode_byte == 0x10 and battery >= 95:
-                            print("\n✅ [안정] 배터리 충전 완료. 임무 재개를 위해 NOMINAL 모드 전환 명령을 송신합니다!")
-                            send_command(sat_sock, 0x20)
-                            last_auto_cmd_time = current_time # 시간 갱신
+                            # 배터리가 20% 이하로 떨어지면 강제로 SAFE 모드 전환 (정상 운용 중일 때만)
+                            elif mode_byte == 0x20 and battery <= 20:
+                                print("\n⚠️ [경고] 배터리 고갈 임박! 태양광 충전을 위해 SAFE 모드 전환 명령을 송신합니다!")
+                                send_command(sat_sock, 0x10) 
+                                last_auto_cmd_time = current_time # 시간 갱신
+                            
+                            # 배터리가 95% 이상 충전되면 다시 임무 수행(NOMINAL) 지시 (충전 중일 때만)
+                            elif mode_byte == 0x10 and battery >= 95:
+                                print("\n✅ [안정] 배터리 충전 완료. 임무 재개를 위해 NOMINAL 모드 전환 명령을 송신합니다!")
+                                send_command(sat_sock, 0x20)
+                                last_auto_cmd_time = current_time # 시간 갱신
 
             # 2초간 데이터가 안 와서 타임아웃 발생 시
             except socket.timeout:

@@ -1,5 +1,6 @@
 import socket
 
+# === 운영자 UI ===
 # 지상국 수신/중계 서버(gs_server.py)와 통신하기 위한 로컬 포트.
 # 사용자가 텍스트를 입력해, 백엔드 서버(gs_server.py)로 전달.
 LOCAL_CMD_PORT = 8000
@@ -27,7 +28,7 @@ def run_terminal():
             
         if cmd in ["SAFE", "NOMINAL"]:
             # 지상국 수신 서버(8000 포트)로 단순 문자열 전송
-            # gs_server.py 의 listen_for_operator_commands 스레드가 이 문자열을 받아 처리함
+            # gs_server.py 의 listen_for_operator_commands 스레드가 이 문자열을 받아 처리.
             sock.sendto(cmd.encode('utf-8'), ("127.0.0.1", LOCAL_CMD_PORT))
             print(f"👉 '{cmd}' 명령을 중계 서버로 전송했습니다.")
         else:

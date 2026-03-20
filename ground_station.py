@@ -6,7 +6,7 @@ import time
 # 03.10일 이후로, groundStation.py와 operator.py로 분리.
 # ========================================================
 
-# === 지상국 : Client ===   : TC : 0x10 = 0x10=SAFE, 0x20=NOMINAL / TM : 0x05 / 응답 : 0x00=ACK, 0xFF=NAK
+# === 지상국 : Client ===   : TC : 0x10=SAFE, 0x20=NOMINAL / TM : 0x05 / 응답 : 0x00=ACK, 0xFF=NAK
 # 1. 위성 주소 설정
 SAT_IP = "127.0.0.1"
 SAT_PORT = 9000
